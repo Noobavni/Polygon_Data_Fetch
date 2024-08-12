@@ -1,0 +1,222 @@
+import time
+import pandas as pd
+import requests
+import urllib.parse
+import hashlib
+import hmac
+import base64
+import numpy as np
+import talib as ta
+import ta
+from ta.trend import MACD, EMAIndicator
+from ta.momentum import RSIIndicator
+from backtesting import Backtest,Strategy
+import talib
+from backtesting.lib import crossover
+from backtesting.lib import plot_heatmaps
+import seaborn as sns
+import matplotlib.pyplot as plt
+from datetime import datetime,timedelta
+
+
+class KrakenWrapper:
+    def __init__(self, api_key, api_secret, api_url):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = api_url
+
+    def get_kraken_signature(self, urlpath, data):
+        postdata = urllib.parse.urlencode(data)
+        encoded = (str(data['nonce']) + postdata).encode()
+        message = urlpath.encode() + hashlib.sha256(encoded).digest()
+        mac = hmac.new(base64.b64decode(self.api_secret), message, hashlib.sha512)
+        sigdigest = base64.b64encode(mac.digest())
+        return sigdigest.decode()
+
+    def kraken_request(self, url_path, data):
+        headers = {
+            'API-Key': self.api_key,
+            'API-Sign': self.get_kraken_signature(url_path, data)
+        }
+        response = requests.post(self.base_url + url_path, headers=headers, data=data)
+        return response
+
+    def get_balance(self):
+        balance = self.kraken_request('/0/private/Balance', {
+            'nonce': str(int(1000 * time.time()))
+        })
+        return balance.json()
+
+    def trade_balance(self):
+        trade_balance = self.kraken_request('/0/private/TradeBalance', {
+            'nonce': str(int(1000 * time.time())),
+            'asset': 'USD'
+        })
+        return trade_balance.json()
+
+    def fetch_ohlcv(self, symbol, interval, since=None):
+        data = {
+            'pair': symbol,
+            'interval': interval,
+        }
+        if since:
+            data['since'] = since
+        response = requests.get(self.base_url + '/0/public/OHLC', params=data)
+        return response.json()['result'][list(response.json()['result'].keys())[0]]
+
+    def open_orders(self):
+        open_orders = self.kraken_request('/0/private/OpenOrders', {
+            'nonce': str(int(1000 * time.time())),
+            'trades': True
+        })
+        return open_orders.json()
+
+    def close_orders(self):
+        close_orders = self.kraken_request('/0/private/ClosedOrders', {
+            'nonce': str(int(1000 * time.time())),
+            'trades': True
+        })
+        return close_orders.json()
+
+    def trade_history(self):
+        trades_history = self.kraken_request('/0/private/TradesHistory', {
+            'nonce': str(int(1000 * time.time())),
+            'trades': True
+        })
+        return trades_history.json()
+
+    def add_trade(self, pair, volume, price):
+        add_trade = self.kraken_request('/0/private/AddOrder', {
+            'nonce': str(int(1000 * time.time())),
+            'ordertype': 'limit',
+            'type': 'buy',
+            'volume': volume,
+            'pair': pair,
+            'price': price
+        })
+        return add_trade.json()
+
+    def cancel_all_orders(self):
+        cancel_all_orders = self.kraken_request('/0/private/CancelAll', {
+            'nonce': str(int(1000 * time.time()))
+        })
+        return cancel_all_orders.json()
+
+    def current_price(self):
+        response = requests.get(self.base_url + '/0/public/Ticker?pair=BTCUSD')
+        current_price = response.json()['result']['XXBTZUSD']['c'][0]
+        return current_price
+
+    def get_all_ohlc_data(self, pair, interval, start, end):
+        all_data = []
+        since = start
+        while since < end:
+            data = self.fetch_ohlcv(pair, interval, since)
+            all_data.extend(data)
+            since = data[-1][0] 
+            time.sleep(1)
+        df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+        df['open'] = pd.to_numeric(df['open'], errors='coerce')
+        df['high'] = pd.to_numeric(df['high'], errors='coerce')
+        df['low'] = pd.to_numeric(df['low'], errors='coerce')
+        df['close'] = pd.to_numeric(df['close'], errors='coerce')
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+        filepath = "ohlcv_data.csv"
+        df.to_csv(filepath, index=False)
+        print(f"Data saved to {filepath}")
+
+class myStrategy:
+    def __init__(self, broker):
+        self.broker = broker
+
+    def fetch_data(self, symbol, timeframe='1d', limit=1000,filepath="ohlcv.csv"):
+        interval_map = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440}
+        interval = interval_map.get(timeframe, 60)
+        data = self.broker.fetch_ohlcv(symbol, interval)
+        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+        df['close'] = pd.to_numeric(df['close'], errors='coerce')
+        return df.tail(limit)
+
+    def calculate_indicators(self, df):
+        df['macd'] = MACD(df['Close']).macd()
+        df['macd_signal'] = MACD(df['Close']).macd_signal()
+        df['rsi'] = RSIIndicator(df['Close']).rsi()
+        df['ema'] = EMAIndicator(df['Close']).ema_indicator()
+        df.dropna(inplace=True)
+        return df
+
+    def generate_signals(self, df):
+        df['signal'] = 0
+        df['signal'] = np.where((df['macd'] > df['macd_signal']) & (df['rsi'] < 30) & (df['close'] > df['ema']), 1, df['signal'])
+        df['signal'] = np.where((df['macd'] < df['macd_signal']) & (df['rsi'] > 70) & (df['close'] < df['ema']), -1, df['signal'])
+        
+        # Debugging: Print the conditions for each signal
+        # for index, row in df.iterrows():
+        #     if row['signal'] == 1:
+        #         print(f"Buy Signal at {row['timestamp']}: MACD {row['macd']} > MACD Signal {row['macd_signal']}, RSI {row['rsi']} < 30, Close {row['close']} > EMA {row['ema']}")
+        #     elif row['signal'] == -1:
+        #         print(f"Sell Signal at {row['timestamp']}: MACD {row['macd']} < MACD Signal {row['macd_signal']}, RSI {row['rsi']} > 70, Close {row['close']} < EMA {row['ema']}")
+        #     else:
+        #         print(f" Signal at {row['timestamp']}: MACD {row['macd']} and MACD Signal {row['macd_signal']}, RSI {row['rsi']} , Close {row['close']} and EMA is  {row['ema']}")
+                
+        return df
+
+    def execute_trade(self, symbol, signal):
+        if signal == 1:
+            self.broker.place_order(symbol, volume=.01, order_type='buy')
+            print("Buy order_placed")
+        elif signal == -1:
+            self.broker.place_order(symbol, volume=.01, order_type='sell')
+            print("Sell order placed")
+        else:
+            print("No Trade")
+
+
+    def run(self, symbol):
+        df = self.fetch_data(symbol,timeframe='1h', limit=1000)
+        df = self.calculate_indicators(df)
+        df = self.generate_signals(df)
+        for index, row in df.iterrows():
+            print(f"Index: {index}, Signal: {row['signal']}")
+            self.execute_trade(symbol, row['signal'])
+class SMAcross(Strategy):
+    short= 7
+    long=50
+    def init(self):
+        close=self.data.Close
+        self.sma1 =self.I(ta.trend.sma_indicator,pd.Series(close),self.short)
+        self.sma2 =self.I(ta.trend.sma_indicator,pd.Series(close),self.long)
+    def next(self):
+        if crossover(self.sma1,self.sma2):
+            self.buy()
+        elif crossover(self.sma2,self.sma1):
+            self.sell()     
+            
+class BacktestStrategy(Strategy):
+    large_rsi=70
+    short_rsi=30
+    def init(self):
+        self.macd = self.data.macd
+        self.macd_signal = self.data.macd_signal
+        self.rsi = self.data.rsi
+        self.ema = self.data.ema
+
+    def next(self):
+        if (self.macd[-1] > self.macd_signal[-1]) and (self.rsi[-1] < self.short_rsi) and (self.data.Close[-1] > self.ema[-1]):
+            self.buy()
+        elif (self.macd[-1] < self.macd_signal[-1]) and (self.rsi[-1] > self.large_rsi ) and (self.data.Close[-1] < self.ema[-1]):
+            self.sell()
+
+
+api_key = 'Your_API'
+api_secret = 'API_Secret'
+api_url = 'https://api.kraken.com'
+broker = KrakenWrapper(api_key, api_secret, api_url)
+strategy = myStrategy(broker)
+# end = int(time.time())
+# start = int((datetime.now() - timedelta(days=365)).timestamp())
+# broker.get_all_ohlc_data('XBTUSD',1440,start,end)
